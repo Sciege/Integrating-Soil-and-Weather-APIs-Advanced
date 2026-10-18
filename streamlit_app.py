@@ -545,77 +545,108 @@ def main():
 
     sites = SITES[SITES["site"].isin(chosen)].reset_index(drop=True)
 
-    if not fetch:
+    if fetch:
+        if sites.empty:
+            st.error("Select at least one site before running.")
+            st.stop()
+        if start > end:
+            st.error("Start date must be on or before the end date.")
+            st.stop()
+
+        # Step 2 & 3: Requests & Telemetry
+        weather_req = build_weather_request(sites, start, end)
+        soil_reqs = [build_soil_request(r.site, r.lat, r.lon) for r in sites.itertuples()]
+
+        status_rows = []
+        try:
+            t0 = time.perf_counter()
+            wres = send(weather_req)
+            elapsed = wres["elapsed_s"] if wres["elapsed_s"] is not None else round(time.perf_counter() - t0, 2)
+            status_rows.append({
+                "API Service": "Open-Meteo",
+                "Target": "All selected sites",
+                "HTTP": str(wres["status"]) if wres["status"] else "200 (Cache)",
+                "From Cache": "Yes (Disk)" if wres["from_cache"] else "No (Network)",
+                "Elapsed": f"{elapsed:.2f}s" if not wres["from_cache"] else "0.00s",
+                "Bytes": f"{wres['bytes']:,}",
+            })
+        except requests.RequestException as exc:
+            st.error(f"Open-Meteo request failed: {exc}")
+            st.stop()
+
+        soil_res = []
+        for i, req in enumerate(soil_reqs):
+            try:
+                res = send(req)
+            except requests.RequestException as exc:
+                st.error(
+                    f"SoilGrids failed for {req['label']}: {exc}. "
+                    "The SoilGrids REST API is a public beta and is occasionally paused. "
+                    "Please retry or use cached fixtures."
+                )
+                st.stop()
+            soil_res.append(res)
+            elapsed = res["elapsed_s"] if res["elapsed_s"] is not None else "0.00"
+            status_rows.append({
+                "API Service": "SoilGrids",
+                "Target": req["label"],
+                "HTTP": str(res["status"]) if res["status"] else "200 (Cache)",
+                "From Cache": "Yes (Disk)" if res["from_cache"] else "No (Network)",
+                "Elapsed": f"{elapsed}s" if not res["from_cache"] else "0.00s",
+                "Bytes": f"{res['bytes']:,}",
+            })
+            if not res["from_cache"] and i < len(soil_reqs) - 1:
+                time.sleep(SOILGRIDS_PAUSE_S)
+
+        # Step 4: Schema Parsing
+        weather = parse_weather(wres["data"], sites)
+        soil_frames = [parse_soil(res["data"], req["label"]) for res, req in zip(soil_res, soil_reqs)]
+        soil_long = pd.concat(soil_frames, ignore_index=True)
+        soil = soil_table(soil_long, sites)
+
+        # Step 5: Relational Integration
+        daily, summary = integrate(weather, soil)
+        assert len(daily) == len(weather), "Join changed the row count; verify site keys."
+
+        missing = soil.loc[soil["clay"].isna(), "site"].tolist()
+
+        # Save integrated dataset in session state so widget reruns preserve the view
+        st.session_state["pipeline_results"] = {
+            "weather_req": weather_req,
+            "soil_reqs": soil_reqs,
+            "status_rows": status_rows,
+            "weather": weather,
+            "soil_long": soil_long,
+            "soil": soil,
+            "daily": daily,
+            "summary": summary,
+            "sites": sites,
+            "missing": missing,
+        }
+
+    if "pipeline_results" not in st.session_state:
         st.info("Select monitoring sites and observation dates above, then click 'Run Integration'.")
         st.stop()
-    if sites.empty:
-        st.error("Select at least one site before running.")
-        st.stop()
-    if start > end:
-        st.error("Start date must be on or before the end date.")
-        st.stop()
 
-    # Step 2 & 3: Requests & Telemetry
-    weather_req = build_weather_request(sites, start, end)
-    soil_reqs = [build_soil_request(r.site, r.lat, r.lon) for r in sites.itertuples()]
+    # Load active pipeline results
+    pipeline = st.session_state["pipeline_results"]
+    weather_req = pipeline["weather_req"]
+    soil_reqs = pipeline["soil_reqs"]
+    status_rows = pipeline["status_rows"]
+    weather = pipeline["weather"]
+    soil_long = pipeline["soil_long"]
+    soil = pipeline["soil"]
+    daily = pipeline["daily"]
+    summary = pipeline["summary"]
+    active_sites = pipeline["sites"]
+    missing = pipeline["missing"]
 
-    status_rows = []
-    try:
-        t0 = time.perf_counter()
-        wres = send(weather_req)
-        elapsed = wres["elapsed_s"] if wres["elapsed_s"] is not None else round(time.perf_counter() - t0, 2)
-        status_rows.append({
-            "API Service": "Open-Meteo",
-            "Target": "All selected sites",
-            "HTTP": str(wres["status"]) if wres["status"] else "200 (Cache)",
-            "From Cache": "Yes (Disk)" if wres["from_cache"] else "No (Network)",
-            "Elapsed": f"{elapsed:.2f}s" if not wres["from_cache"] else "0.00s",
-            "Bytes": f"{wres['bytes']:,}",
-        })
-    except requests.RequestException as exc:
-        st.error(f"Open-Meteo request failed: {exc}")
-        st.stop()
-
-    soil_res = []
-    for i, req in enumerate(soil_reqs):
-        try:
-            res = send(req)
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"SoilGrids failed for {req['label']}: {exc}. "
-                "The SoilGrids REST API is a public beta and is occasionally paused. "
-                "Please retry or use cached fixtures."
-            ) from exc
-        soil_res.append(res)
-        elapsed = res["elapsed_s"] if res["elapsed_s"] is not None else "0.00"
-        status_rows.append({
-            "API Service": "SoilGrids",
-            "Target": req["label"],
-            "HTTP": str(res["status"]) if res["status"] else "200 (Cache)",
-            "From Cache": "Yes (Disk)" if res["from_cache"] else "No (Network)",
-            "Elapsed": f"{elapsed}s" if not res["from_cache"] else "0.00s",
-            "Bytes": f"{res['bytes']:,}",
-        })
-        if not res["from_cache"] and i < len(soil_reqs) - 1:
-            time.sleep(SOILGRIDS_PAUSE_S)
-
-    # Step 4: Schema Parsing
-    weather = parse_weather(wres["data"], sites)
-    soil_frames = [parse_soil(res["data"], req["label"]) for res, req in zip(soil_res, soil_reqs)]
-    soil_long = pd.concat(soil_frames, ignore_index=True)
-    soil = soil_table(soil_long, sites)
-
-    missing = soil.loc[soil["clay"].isna(), "site"].tolist()
     if missing:
         st.warning(
             f"SoilGrids returned null for: {', '.join(missing)}. "
             "The coordinate falls on water, built-up ground, or an unmapped grid. "
             "Try adjusting coordinates slightly inland."
         )
-
-    # Step 5: Relational Integration
-    daily, summary = integrate(weather, soil)
-    assert len(daily) == len(weather), "Join changed the row count; verify site keys."
 
     # Section: Data Pipeline & Normalization
     st.markdown("---")
@@ -663,7 +694,14 @@ def main():
     # Row 1: Q2 & Q3 Paired
     col_q2, col_q3 = st.columns(2)
     with col_q2:
-        selected_q2 = st.selectbox("Site for Q2 Demand Analysis", sites["site"].tolist(), index=0)
+        site_options = active_sites["site"].tolist()
+        if "q2_site_select" in st.session_state and st.session_state["q2_site_select"] not in site_options:
+            st.session_state["q2_site_select"] = site_options[0]
+        selected_q2 = st.selectbox(
+            "Site for Q2 Demand Analysis",
+            site_options,
+            key="q2_site_select",
+        )
         st.plotly_chart(chart_q2(daily, selected_q2), use_container_width=True)
     with col_q3:
         st.write("")  # Alignment spacer for selectbox
