@@ -1,0 +1,11 @@
+# How to Run
+
+```bash
+cd api-app
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+Open `http://localhost:8501` in your browser.
