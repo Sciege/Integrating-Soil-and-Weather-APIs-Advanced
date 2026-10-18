@@ -1,0 +1,27 @@
+# Virtual environment and Python bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Streamlit local credentials and secrets
+.streamlit/secrets.toml
+
+# AI agent instructions, skills, and configuration
+AGENTS.md
+agents.md
+[aA][gG][eE][nN][tT][sS].md
+*.agent.md
+.agents/
+.opencode/
+anti-slop/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
